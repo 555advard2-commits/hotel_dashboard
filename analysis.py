@@ -3,6 +3,8 @@ import pandas as pd
 import plotly.express as px
 
 from config import METRICS, SUCCESS_OUTCOMES
+from action_log_effect_calculator import assign_effect_type, get_analysis_months, get_effective_month
+from action_log_effect_config import EFFECT_TYPE_LABELS
 from utils import (
     safe_divide, month_diff_inclusive, make_period_column,
     make_period_label, add_months, mode_value, classify_outcome_group
@@ -330,6 +332,28 @@ def classify_action(row):
     return "Слабый отрицательный эффект"
 
 
+
+def _to_month_timestamp(value):
+    if value is None or pd.isna(value):
+        return pd.NaT
+    if isinstance(value, pd.Period):
+        return value.to_timestamp()
+    return pd.Timestamp(value).to_period("M").to_timestamp()
+
+
+def _get_action_effect_months(action_date, effect_type):
+    parsed_date = pd.to_datetime(action_date, errors="coerce")
+    if pd.isna(parsed_date) or effect_type == "unknown":
+        return pd.NaT, pd.NaT, pd.NaT
+    effective_period = get_effective_month(parsed_date)
+    before_period, after_period = get_analysis_months(effective_period, effect_type)
+    return (
+        _to_month_timestamp(effective_period),
+        _to_month_timestamp(before_period),
+        _to_month_timestamp(after_period),
+    )
+
+
 def calculate_action_impact(
     actions_df, enriched_df, metric_name,
     pre_window_months, post_window_months, lag_months,
@@ -337,10 +361,22 @@ def calculate_action_impact(
 ):
     if actions_df.empty:
         return pd.DataFrame()
+
     base = enriched_df.copy()
     actions_work = actions_df.copy().reset_index(drop=True)
     if "action_id" not in actions_work.columns:
         actions_work["action_id"] = np.arange(1, len(actions_work) + 1)
+
+    actions_work["effect_type"] = actions_work["subject"].apply(assign_effect_type)
+    actions_work["effect_type_label"] = actions_work["effect_type"].map(EFFECT_TYPE_LABELS).fillna(EFFECT_TYPE_LABELS["unknown"])
+    effect_months = actions_work.apply(
+        lambda row: _get_action_effect_months(row.get("action_date"), row.get("effect_type")),
+        axis=1,
+    )
+    actions_work["effective_month"] = [months[0] for months in effect_months]
+    actions_work["before_month"] = [months[1] for months in effect_months]
+    actions_work["after_month"] = [months[2] for months in effect_months]
+
     hotel_lookup = base.set_index(["hotel_id", "month"])[
         [metric_name, "expected_value", "segment_key"]
     ]
@@ -353,69 +389,81 @@ def calculate_action_impact(
         base.groupby(["segment_key", "month"], as_index=False)
         .agg(
             group_actual=(metric_name, "sum"),
-            group_expected=("expected_value", "sum")
+            group_expected=("expected_value", "sum"),
         )
     )
     group_lookup = group_month.set_index(["segment_key", "month"])[
         ["group_actual", "group_expected"]
     ]
+
     rows = []
     for _, action in actions_work.iterrows():
         hotel_id = action["hotel_id"]
         action_id = action["action_id"]
         action_month = action["action_month"]
+        effect_type = action["effect_type"]
+        effect_type_label = action["effect_type_label"]
+        effective_month = action["effective_month"]
+        before_month = action["before_month"]
+        after_month = action["after_month"]
+
         segment_row = hotel_segment[hotel_segment["hotel_id"] == hotel_id]
-        if segment_row.empty:
-            continue
-        segment_key = segment_row["hotel_segment_key"].iloc[0]
-        pre_months = [add_months(action_month, -i) for i in range(pre_window_months, 0, -1)]
-        lag_period_months = [add_months(action_month, i) for i in range(1, lag_months + 1)]
-        post_months = [add_months(action_month, i) for i in range(1 + lag_months, 1 + lag_months + post_window_months)]
-        evaluation_months = pre_months + [action_month] + lag_period_months + post_months
+        segment_key = segment_row["hotel_segment_key"].iloc[0] if not segment_row.empty else ""
+        pre_months = [before_month] if pd.notna(before_month) else []
+        post_months = [after_month] if pd.notna(after_month) else []
+        evaluation_months = pre_months + ([effective_month] if pd.notna(effective_month) else []) + post_months
         evaluation_start = min(evaluation_months) if evaluation_months else action_month
         evaluation_end = max(evaluation_months) if evaluation_months else action_month
+
         same_hotel_actions = actions_work[
             (actions_work["hotel_id"] == hotel_id)
             & (actions_work["action_id"] != action_id)
-            & (actions_work["action_month"] >= evaluation_start)
-            & (actions_work["action_month"] <= evaluation_end)
+            & (actions_work["effective_month"] >= evaluation_start)
+            & (actions_work["effective_month"] <= evaluation_end)
         ]
         overlapping_actions_count = int(len(same_hotel_actions))
         has_overlap = overlapping_actions_count > 0
         overlap_subjects = ", ".join(sorted(same_hotel_actions["subject"].dropna().astype(str).unique()[:5]))
-        pre_hotel_index = pd.MultiIndex.from_product(
-            [[hotel_id], pre_months], names=["hotel_id", "month"]
-        )
-        post_hotel_index = pd.MultiIndex.from_product(
-            [[hotel_id], post_months], names=["hotel_id", "month"]
-        )
-        pre_group_index = pd.MultiIndex.from_product(
-            [[segment_key], pre_months], names=["segment_key", "month"]
-        )
-        post_group_index = pd.MultiIndex.from_product(
-            [[segment_key], post_months], names=["segment_key", "month"]
-        )
+
+        pre_hotel_index = pd.MultiIndex.from_product([[hotel_id], pre_months], names=["hotel_id", "month"])
+        post_hotel_index = pd.MultiIndex.from_product([[hotel_id], post_months], names=["hotel_id", "month"])
+        pre_group_index = pd.MultiIndex.from_product([[segment_key], pre_months], names=["segment_key", "month"])
+        post_group_index = pd.MultiIndex.from_product([[segment_key], post_months], names=["segment_key", "month"])
+
         pre_hotel = hotel_lookup.reindex(pre_hotel_index).fillna(0)
         post_hotel = hotel_lookup.reindex(post_hotel_index).fillna(0)
         pre_group = group_lookup.reindex(pre_group_index).fillna(0)
         post_group = group_lookup.reindex(post_group_index).fillna(0)
+
         pre_months_available = int((pre_hotel["expected_value"] > 0).sum())
         post_months_available = int((post_hotel["expected_value"] > 0).sum())
         pre_actual = pre_hotel[metric_name].sum()
         pre_expected = pre_hotel["expected_value"].sum()
         post_actual = post_hotel[metric_name].sum()
         post_expected = post_hotel["expected_value"].sum()
+
         exclusion_reasons = []
-        if pre_months_available < min_months_per_side:
-            exclusion_reasons.append(f"мало месяцев ДО: {pre_months_available} из {pre_window_months}")
-        if post_months_available < min_months_per_side:
-            exclusion_reasons.append(f"мало месяцев ПОСЛЕ: {post_months_available} из {post_window_months}")
+        if segment_row.empty:
+            exclusion_reasons.append("нет сегмента отеля для сравнения")
+        if effect_type == "unknown":
+            exclusion_reasons.append("тип эффекта не определен по subject")
+        if pd.isna(effective_month):
+            exclusion_reasons.append("некорректная дата Action Log")
+        if not pre_months:
+            exclusion_reasons.append("нет месяца ДО по методологии эффекта")
+        if not post_months:
+            exclusion_reasons.append("нет месяца ПОСЛЕ по методологии эффекта")
+        if pre_months and pre_months_available < 1:
+            exclusion_reasons.append(f"мало месяцев ДО: {pre_months_available} из 1")
+        if post_months and post_months_available < 1:
+            exclusion_reasons.append(f"мало месяцев ПОСЛЕ: {post_months_available} из 1")
         if pre_expected <= 0:
             exclusion_reasons.append("нулевое ожидание ДО")
         if post_expected <= 0:
             exclusion_reasons.append("нулевое ожидание ПОСЛЕ")
         if overlap_policy == "Исключать действия с наложениями" and has_overlap:
             exclusion_reasons.append("есть другие Action Logs в окне оценки")
+
         included_in_effect = len(exclusion_reasons) == 0
         pre_eff = safe_divide(pre_actual, pre_expected)
         post_eff = safe_divide(post_actual, post_expected)
@@ -428,6 +476,7 @@ def calculate_action_impact(
         post_peer_eff = safe_divide(post_peer_actual, post_peer_expected)
         peer_change = post_peer_eff - pre_peer_eff if not pd.isna(pre_peer_eff) and not pd.isna(post_peer_eff) else np.nan
         manager_effect = hotel_change - peer_change if not pd.isna(hotel_change) and not pd.isna(peer_change) else np.nan
+
         if not included_in_effect:
             manager_effect_to_store = np.nan
             hotel_change_to_store = np.nan
@@ -436,29 +485,36 @@ def calculate_action_impact(
             manager_effect_to_store = manager_effect
             hotel_change_to_store = hotel_change
             peer_change_to_store = peer_change
+
         evaluation_note = ""
         if has_overlap:
             evaluation_note = "В окне есть другие Action Logs этого же отеля"
             if overlap_subjects:
                 evaluation_note += f": {overlap_subjects}"
+
         rows.append({
             "action_id": action_id,
             "hotel_id": hotel_id,
             "segment_key": segment_key,
             "action_date": action["action_date"],
             "action_month": action_month,
+            "effective_month": effective_month,
+            "before_month": before_month,
+            "after_month": after_month,
             "subject": action["subject"],
             "outcome": action["outcome"],
             "outcome_group": action.get("outcome_group", ""),
-            "pre_window_months": pre_window_months,
-            "lag_months": lag_months,
-            "post_window_months": post_window_months,
+            "effect_type": effect_type,
+            "effect_type_label": effect_type_label,
+            "pre_window_months": 1,
+            "lag_months": np.nan,
+            "post_window_months": 1,
             "pre_months_available": pre_months_available,
             "post_months_available": post_months_available,
             "has_overlap": has_overlap,
             "overlapping_actions_count": overlapping_actions_count,
             "included_in_effect": included_in_effect,
-            "exclusion_reason": "; ".join(exclusion_reasons),
+            "exclusion_reason": "; ".join(dict.fromkeys(exclusion_reasons)),
             "evaluation_note": evaluation_note,
             "pre_actual": pre_actual,
             "pre_expected": pre_expected,
@@ -470,18 +526,18 @@ def calculate_action_impact(
             "peer_change_pp": peer_change_to_store * 100 if not pd.isna(peer_change_to_store) else np.nan,
             "manager_effect_pp": manager_effect_to_store * 100 if not pd.isna(manager_effect_to_store) else np.nan,
             "pre_peer_efficiency": pre_peer_eff,
-            "post_peer_efficiency": post_peer_eff
+            "post_peer_efficiency": post_peer_eff,
         })
+
     result = pd.DataFrame(rows)
     if result.empty:
         return result
     result = result.replace([np.inf, -np.inf], np.nan)
     result["verdict"] = result.apply(classify_action, axis=1)
     result.loc[result["included_in_effect"] == False, "verdict"] = (
-        "Исключено из расчёта: " + result.loc[result["included_in_effect"] == False, "exclusion_reason"].fillna("")
+        "Исключено из расчета: " + result.loc[result["included_in_effect"] == False, "exclusion_reason"].fillna("")
     )
     return result
-
 
 def calculate_worked_vs_not_worked(period_classification, actions_df):
     df = period_classification.copy()
