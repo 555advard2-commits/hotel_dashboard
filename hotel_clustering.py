@@ -461,7 +461,9 @@ def _run_clustering(features_df, k, feature_columns, mode_name):
     metrics["feature_columns"] = usable
     profile = build_cluster_profile(result)
     names = dict(zip(profile["cluster_id"], profile["cluster_name"])) if not profile.empty else {}
-    result["cluster_name"] = result["cluster_id"].map(names).fillna(result["cluster_id"].apply(lambda x: f"Кластер {int(x)}"))
+    explanations = dict(zip(profile["cluster_id"], profile["cluster_explanation"])) if not profile.empty and "cluster_explanation" in profile.columns else {}
+    result["cluster_name"] = result["cluster_id"].map(names).fillna(result["cluster_id"].apply(lambda x: f"??????? {int(x)}"))
+    result["cluster_explanation"] = result["cluster_id"].map(explanations).fillna("")
     return result, scaled, metrics
 
 
@@ -486,28 +488,87 @@ def run_complex_clustering(features_df, k):
     return _run_clustering(features_df, k, _complex_columns(features_df), "complex")
 
 
-def _name_cluster(row, global_medians):
-    parts = []
-    los_median = global_medians.get("LOS", 0)
-    if row.get("str_share", 0) >= 0.6 or row.get("LOS", 0) >= max(los_median * 1.35, 5):
-        parts.append("STR / long-stay")
-    if row.get("avg_monthly_revenue", 0) >= global_medians.get("avg_monthly_revenue", 0) * 1.25:
-        parts.append("крупные")
-    elif row.get("avg_monthly_revenue", 0) <= global_medians.get("avg_monthly_revenue", 0) * 0.75:
-        parts.append("малые")
-    if row.get("ADR", 0) >= global_medians.get("ADR", 0) * 1.25:
-        parts.append("дорогие")
-    if row.get("summer_share", 0) >= 0.38:
-        parts.append("летние сезонные")
-    elif row.get("winter_share", 0) >= 0.34:
-        parts.append("зимние сезонные")
-    elif row.get("CV", 0) <= global_medians.get("CV", 0) * 0.8:
-        parts.append("стабильные")
-    if row.get("growth_2025_vs_2024", 0) >= 0.15:
-        parts.append("растущие")
-    if not parts:
-        parts.append("сбалансированные")
-    return " ".join(parts[:3]).capitalize()
+
+def _cluster_label(text):
+    return text.encode("ascii").decode("unicode_escape")
+
+
+def _safe_relative_delta(value, baseline):
+    if pd.isna(value) or pd.isna(baseline) or abs(float(baseline)) < 1e-9:
+        return 0.0
+    return float(value - baseline) / max(abs(float(baseline)), 1e-9)
+
+
+def _build_cluster_traits(row, global_stats):
+    medians = global_stats.get("medians", {})
+    means = global_stats.get("means", {})
+    traits = []
+
+    revenue_delta = _safe_relative_delta(row.get("avg_revenue"), medians.get("avg_monthly_revenue"))
+    if revenue_delta >= 0.30:
+        traits.append((abs(revenue_delta), _cluster_label("\\u043a\\u0440\\u0443\\u043f\\u043d\\u044b\\u0435"), _cluster_label("\\u0432\\u044b\\u0441\\u043e\\u043a\\u0438\\u0439 \\u0441\\u0440\\u0435\\u0434\\u043d\\u0438\\u0439 revenue")))
+    elif revenue_delta <= -0.30:
+        traits.append((abs(revenue_delta), _cluster_label("\\u043c\\u0430\\u043b\\u044b\\u0435"), _cluster_label("\\u043d\\u0438\\u0437\\u043a\\u0438\\u0439 \\u0441\\u0440\\u0435\\u0434\\u043d\\u0438\\u0439 revenue")))
+
+    adr_delta = _safe_relative_delta(row.get("ADR"), medians.get("ADR"))
+    if adr_delta >= 0.25:
+        traits.append((abs(adr_delta), _cluster_label("\\u0434\\u043e\\u0440\\u043e\\u0433\\u0438\\u0435"), _cluster_label("ADR \\u0432\\u044b\\u0448\\u0435 \\u0442\\u0438\\u043f\\u0438\\u0447\\u043d\\u043e\\u0433\\u043e \\u0443\\u0440\\u043e\\u0432\\u043d\\u044f")))
+    elif adr_delta <= -0.25:
+        traits.append((abs(adr_delta), _cluster_label("\\u0431\\u044e\\u0434\\u0436\\u0435\\u0442\\u043d\\u044b\\u0435"), _cluster_label("ADR \\u043d\\u0438\\u0436\\u0435 \\u0442\\u0438\\u043f\\u0438\\u0447\\u043d\\u043e\\u0433\\u043e \\u0443\\u0440\\u043e\\u0432\\u043d\\u044f")))
+
+    los_delta = _safe_relative_delta(row.get("LOS"), medians.get("LOS"))
+    if row.get("str_share", 0) >= 0.60:
+        traits.append((1.20, _cluster_label("STR / \\u0430\\u043f\\u0430\\u0440\\u0442\\u0430\\u043c\\u0435\\u043d\\u0442\\u044b"), _cluster_label("\\u0432\\u044b\\u0441\\u043e\\u043a\\u0430\\u044f \\u0434\\u043e\\u043b\\u044f \\u0430\\u043f\\u0430\\u0440\\u0442\\u0430\\u043c\\u0435\\u043d\\u0442\\u043e\\u0432")))
+    elif los_delta >= 0.35:
+        traits.append((abs(los_delta), _cluster_label("long-stay"), _cluster_label("LOS \\u0432\\u044b\\u0448\\u0435 \\u0442\\u0438\\u043f\\u0438\\u0447\\u043d\\u043e\\u0433\\u043e \\u0443\\u0440\\u043e\\u0432\\u043d\\u044f")))
+    elif los_delta <= -0.30:
+        traits.append((abs(los_delta), _cluster_label("\\u043a\\u043e\\u0440\\u043e\\u0442\\u043a\\u0438\\u0435 \\u043f\\u0440\\u043e\\u0436\\u0438\\u0432\\u0430\\u043d\\u0438\\u044f"), _cluster_label("LOS \\u043d\\u0438\\u0436\\u0435 \\u0442\\u0438\\u043f\\u0438\\u0447\\u043d\\u043e\\u0433\\u043e \\u0443\\u0440\\u043e\\u0432\\u043d\\u044f")))
+
+    summer_delta = _safe_relative_delta(row.get("summer_share"), means.get("summer_share"))
+    winter_delta = _safe_relative_delta(row.get("winter_share"), means.get("winter_share"))
+    if row.get("summer_share", 0) >= 0.36 and summer_delta >= 0.15:
+        traits.append((abs(summer_delta), _cluster_label("\\u043b\\u0435\\u0442\\u043d\\u0438\\u0439 \\u043f\\u0438\\u043a"), _cluster_label("\\u0432\\u044b\\u0441\\u043e\\u043a\\u0430\\u044f \\u0434\\u043e\\u043b\\u044f \\u043b\\u0435\\u0442\\u043d\\u0435\\u0433\\u043e \\u0441\\u043f\\u0440\\u043e\\u0441\\u0430")))
+    if row.get("winter_share", 0) >= 0.32 and winter_delta >= 0.15:
+        traits.append((abs(winter_delta), _cluster_label("\\u0437\\u0438\\u043c\\u043d\\u0438\\u0439 \\u043f\\u0438\\u043a"), _cluster_label("\\u0432\\u044b\\u0441\\u043e\\u043a\\u0430\\u044f \\u0434\\u043e\\u043b\\u044f \\u0437\\u0438\\u043c\\u043d\\u0435\\u0433\\u043e \\u0441\\u043f\\u0440\\u043e\\u0441\\u0430")))
+
+    cv_delta = _safe_relative_delta(row.get("CV"), medians.get("CV"))
+    if cv_delta <= -0.20:
+        traits.append((abs(cv_delta), _cluster_label("\\u0441\\u0442\\u0430\\u0431\\u0438\\u043b\\u044c\\u043d\\u044b\\u0435"), _cluster_label("CV \\u043d\\u0438\\u0436\\u0435 \\u043c\\u0435\\u0434\\u0438\\u0430\\u043d\\u044b, \\u0441\\u043f\\u0440\\u043e\\u0441 \\u0440\\u043e\\u0432\\u043d\\u0435\\u0435")))
+    elif cv_delta >= 0.25:
+        traits.append((abs(cv_delta), _cluster_label("\\u043d\\u0435\\u0441\\u0442\\u0430\\u0431\\u0438\\u043b\\u044c\\u043d\\u044b\\u0435"), _cluster_label("CV \\u0432\\u044b\\u0448\\u0435 \\u043c\\u0435\\u0434\\u0438\\u0430\\u043d\\u044b, \\u0441\\u043f\\u0440\\u043e\\u0441 \\u043c\\u0435\\u043d\\u0435\\u0435 \\u0440\\u043e\\u0432\\u043d\\u044b\\u0439")))
+
+    growth = row.get("growth_2025_vs_2024")
+    if pd.notna(growth):
+        if growth >= 0.15:
+            traits.append((abs(float(growth)), _cluster_label("\\u0440\\u0430\\u0441\\u0442\\u0443\\u0449\\u0438\\u0435"), _cluster_label("\\u043f\\u043e\\u043b\\u043e\\u0436\\u0438\\u0442\\u0435\\u043b\\u044c\\u043d\\u044b\\u0439 \\u0440\\u043e\\u0441\\u0442 2025 \\u043a 2024")))
+        elif growth <= -0.15:
+            traits.append((abs(float(growth)), _cluster_label("\\u0441\\u043d\\u0438\\u0436\\u0430\\u044e\\u0449\\u0438\\u0435\\u0441\\u044f"), _cluster_label("\\u043e\\u0442\\u0440\\u0438\\u0446\\u0430\\u0442\\u0435\\u043b\\u044c\\u043d\\u0430\\u044f \\u0434\\u0438\\u043d\\u0430\\u043c\\u0438\\u043a\\u0430 2025 \\u043a 2024")))
+
+    return sorted(traits, key=lambda item: item[0], reverse=True)
+
+
+def _name_cluster(row, global_stats):
+    traits = _build_cluster_traits(row, global_stats)
+    labels = []
+    for _, label, _ in traits:
+        if label not in labels:
+            labels.append(label)
+        if len(labels) >= 3:
+            break
+    if not labels:
+        labels = [_cluster_label("\\u0441\\u0431\\u0430\\u043b\\u0430\\u043d\\u0441\\u0438\\u0440\\u043e\\u0432\\u0430\\u043d\\u043d\\u044b\\u0435")]
+    return " ".join(labels).capitalize()
+
+
+def _explain_cluster(row, global_stats):
+    traits = _build_cluster_traits(row, global_stats)
+    reasons = []
+    for _, _, reason in traits[:4]:
+        if reason not in reasons:
+            reasons.append(reason)
+    if not reasons:
+        reasons = [_cluster_label("\\u043d\\u0435\\u0442 \\u0440\\u0435\\u0437\\u043a\\u043e\\u0433\\u043e \\u043e\\u0442\\u043b\\u0438\\u0447\\u0438\\u044f \\u043e\\u0442 \\u0441\\u0440\\u0435\\u0434\\u043d\\u0435\\u0433\\u043e \\u043f\\u0440\\u043e\\u0444\\u0438\\u043b\\u044f")]
+    return "; ".join(reasons)
 
 
 def build_cluster_profile(clustered_df):
@@ -539,7 +600,10 @@ def build_cluster_profile(clustered_df):
         )
         .sort_values("cluster_id")
     )
-    global_medians = df[["avg_monthly_revenue", "ADR", "LOS", "CV"]].median(numeric_only=True).to_dict()
+    global_stats = {
+        "medians": df[["avg_monthly_revenue", "ADR", "LOS", "CV"]].median(numeric_only=True).to_dict(),
+        "means": df[["summer_share", "winter_share"]].mean(numeric_only=True).to_dict(),
+    }
     top_months = []
     for cluster_id, group in df.groupby("cluster_id"):
         monthly_cols = [f"roomnights_share_m{m:02d}" for m in range(1, 13)]
@@ -550,11 +614,12 @@ def build_cluster_profile(clustered_df):
             "top_demand_months": ", ".join(MONTH_NAMES_SHORT[int(col[-2:])] for col in top.index)
         })
     profile = profile.merge(pd.DataFrame(top_months), on="cluster_id", how="left")
-    profile["cluster_name"] = profile.apply(lambda row: _name_cluster(row, global_medians), axis=1)
+    profile["cluster_name"] = profile.apply(lambda row: _name_cluster(row, global_stats), axis=1)
+    profile["cluster_explanation"] = profile.apply(lambda row: _explain_cluster(row, global_stats), axis=1)
     duplicated = profile["cluster_name"].duplicated(keep=False)
     if duplicated.any():
         profile.loc[duplicated, "cluster_name"] = profile.loc[duplicated].apply(
-            lambda row: f"{row['cluster_name']} — группа {int(row['cluster_id'])}", axis=1
+            lambda row: f"{row['cluster_name']} / {row['top_demand_months']}", axis=1
         )
     return profile
 

@@ -60,6 +60,68 @@ def timed_step(step_name):
 print(f"[PERF] ===== Streamlit rerun {time.strftime('%Y-%m-%d %H:%M:%S')} =====", flush=True)
 
 
+CLUSTER_FIELD_DESCRIPTIONS = {
+    "cluster_id": "Технический номер кластера. Используется для связи таблиц и графиков.",
+    "cluster_name": "Бизнес-название группы, сформированное по профилю отелей внутри кластера.",
+    "cluster_explanation": "Краткое объяснение, какие признаки сильнее всего отличают кластер от общей выборки.",
+    "is_STR": "Признак апартаментов. True — апартаменты, False — отель.",
+    "hotels_count": "Количество отелей в кластере.",
+    "str_share": "Доля апартаментов внутри кластера.",
+    "avg_monthly_revenue": "Средний месячный доход объекта за выбранный период.",
+    "avg_revenue": "Средний месячный доход отелей внутри кластера.",
+    "median_revenue": "Медианный месячный доход: типичный объект кластера без сильного влияния выбросов.",
+    "avg_monthly_roomnights": "Среднее количество ночей в месяц.",
+    "avg_roomnights": "Среднее количество ночей в месяц по кластеру.",
+    "avg_monthly_gbb": "Среднее количество бронирований в месяц.",
+    "avg_gbb": "Среднее количество бронирований в месяц по кластеру.",
+    "ADR": "Average Daily Rate: revenue / roomnights. Показывает средний доход на одну ночь.",
+    "LOS": "Length of Stay: roomnights / GBB. Показывает среднюю длительность проживания.",
+    "SI": "Seasonality Index. Чем выше, тем сильнее пиковый месяц отличается от обычного месяца.",
+    "CV": "Coefficient of Variation. Чем выше, тем менее стабильна динамика по месяцам.",
+    "summer_share": "Доля спроса, приходящаяся на июнь, июль и август.",
+    "winter_share": "Доля спроса, приходящаяся на декабрь, январь и февраль.",
+    "growth_2025_vs_2024": "Рост 2025 к 2024 по revenue. 0.10 означает примерно +10%.",
+    "months_available": "Количество месяцев, по которым у объекта есть данные в выбранной выборке.",
+    "top_demand_months": "Три календарных месяца с максимальной средней долей спроса.",
+    "hotels_with_actions": "Количество отелей кластера, у которых были Action Logs после фильтров.",
+    "actions_count": "Количество действий BizDev в кластере после фильтров.",
+    "avg_effect": "Средний manager effect по действиям в кластере.",
+    "median_effect": "Медианный manager effect: более устойчив к выбросам, чем среднее.",
+    "success_rate": "Доля действий с положительным manager effect.",
+}
+
+
+def render_cluster_explanations(title, columns):
+    items = []
+    for column in columns:
+        description = CLUSTER_FIELD_DESCRIPTIONS.get(column)
+        if description:
+            items.append(f"<li><b>{html.escape(column)}</b> — {html.escape(description)}</li>")
+    if not items:
+        return
+    st.markdown(
+        f"""
+        <div class="corporate-card">
+            <h3>{html.escape(title)}</h3>
+            <ul>{''.join(items)}</ul>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+
+def render_method_note(title, body):
+    st.markdown(
+        f"""
+        <div class="corporate-card">
+            <h3>{html.escape(title)}</h3>
+            <p>{html.escape(body)}</p>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+
 st.set_page_config(
     page_title="Hotel Seasonality & Manager Impact",
     layout="wide",
@@ -789,10 +851,14 @@ with tab8:
         m1.metric("Отелей в кластеризации", format_number(clustered_df["hotel_id"].nunique()))
         m2.metric("Silhouette score", format_number(cluster_metrics.get("silhouette_score"), 3))
         m3.metric("Inertia / Elbow", format_number(cluster_metrics.get("inertia"), 2))
+        render_method_note(
+            "Как читать качество кластеризации",
+            "Silhouette score показывает, насколько отели внутри одного кластера похожи друг на друга и отличаются от соседних кластеров. Чем ближе к 1, тем лучше разделение. Inertia показывает суммарное расстояние отелей до центров кластеров: показатель полезен для сравнения разных k, но сам по себе не является бизнес-выводом."
+        )
 
         st.markdown("### Таблица признаков")
         feature_cols = [
-            "hotel_id", "cluster_id", "cluster_name", "is_STR",
+            "hotel_id", "cluster_id", "cluster_name", "cluster_explanation", "is_STR",
             "avg_monthly_revenue", "avg_monthly_roomnights", "avg_monthly_gbb",
             "ADR", "LOS", "SI", "CV", "summer_share", "winter_share",
             "growth_2025_vs_2024", "months_available"
@@ -801,12 +867,14 @@ with tab8:
         numeric_cols = feature_table.select_dtypes(include=[np.number]).columns
         feature_table[numeric_cols] = feature_table[numeric_cols].round(3)
         st.dataframe(feature_table, use_container_width=True, hide_index=True)
+        render_cluster_explanations("Что означают столбцы таблицы признаков", feature_table.columns)
 
         st.markdown("### Профиль кластеров")
         profile_shown = cluster_profile.copy()
         numeric_cols = profile_shown.select_dtypes(include=[np.number]).columns
         profile_shown[numeric_cols] = profile_shown[numeric_cols].round(3)
         st.dataframe(profile_shown, use_container_width=True, hide_index=True)
+        render_cluster_explanations('Что означают столбцы профиля кластеров', profile_shown.columns)
 
         st.markdown("### Сезонность по кластерам")
         seasonality_rows = []
@@ -832,7 +900,7 @@ with tab8:
         )
         seasonality_fig.update_layout(xaxis={"categoryorder": "array", "categoryarray": list(MONTH_NAMES.values())})
         safe_plotly_chart(seasonality_fig, use_container_width=True, key="plot_hotel_cluster_seasonality")
-
+        render_method_note("Вывод по сезонности", "График показывает форму спроса внутри каждого кластера. Если линия имеет выраженный пик, кластер сезонный; если линия ровная, объекты работают более равномерно. По методике сезонность нужна для бизнес-интерпретации групп, но Action Logs не участвуют в построении этих линий.")
         st.markdown("### PCA scatter plot")
         pca_fig = px.scatter(
             clustered_df,
@@ -843,7 +911,7 @@ with tab8:
         )
         pca_fig.update_layout(height=560)
         safe_plotly_chart(pca_fig, use_container_width=True, key="plot_hotel_cluster_pca")
-
+        render_method_note("Вывод по PCA", "PCA сжимает множество признаков до двух осей, чтобы визуально проверить разделение кластеров. Хороший признак - группы заметно отделяются друг от друга. Если точки сильно перемешаны, кластеры могут быть близкими по бизнес-профилю, и k стоит перепроверить по таблице профиля.")
         st.markdown("### Heatmap признаков по кластерам")
         heatmap_features = [
             "avg_monthly_revenue", "avg_monthly_roomnights", "avg_monthly_gbb",
@@ -860,7 +928,7 @@ with tab8:
             title="Отклонение признаков кластера от среднего"
         )
         safe_plotly_chart(heat_fig, use_container_width=True, key="plot_hotel_cluster_heatmap")
-
+        render_method_note("Вывод по heatmap", "Heatmap показывает отклонения признаков кластера от среднего по всей выборке. Рыжий цвет означает, что кластер выше среднего по признаку, синий - ниже среднего. Это главный график для объяснения, чем один кластер бизнесово отличается от другого.")
         st.markdown("### Размеры кластеров")
         size_fig = px.bar(
             cluster_profile,
@@ -869,7 +937,7 @@ with tab8:
             title="Количество отелей в каждом кластере"
         )
         safe_plotly_chart(size_fig, use_container_width=True, key="plot_hotel_cluster_sizes")
-
+        render_method_note("Вывод по размерам кластеров", "График нужен для проверки устойчивости типологии. Очень маленький кластер может быть реальной нишевой группой, но также может быть выбросом. Если один кластер забирает почти всю выборку, выбранное k может быть слишком большим или признаки плохо разделяют объекты.")
         st.markdown("### BizDev effect by cluster")
         if bizdev_effect_by_cluster.empty:
             st.info("Нет рассчитанных BizDev-действий для присоединения к кластерам.")
@@ -878,9 +946,10 @@ with tab8:
             numeric_cols = bizdev_shown.select_dtypes(include=[np.number]).columns
             bizdev_shown[numeric_cols] = bizdev_shown[numeric_cols].round(3)
             st.dataframe(bizdev_shown, use_container_width=True, hide_index=True)
-
+            render_cluster_explanations("Что означают столбцы BizDev effect by cluster", bizdev_shown.columns)
+            render_method_note("Вывод по BizDev внутри кластеров", "Эта таблица не влияет на построение кластеров. Сначала отели получают cluster_id по собственным признакам, и только потом Action Logs присоединяются по hotel_id. Сравнивайте subject, средний/медианный эффект и success rate внутри каждого кластера: так видно, какие действия лучше работают для разных типов объектов.")
         export_cols = [
-            "hotel_id", "cluster_id", "cluster_name", "is_STR",
+            "hotel_id", "cluster_id", "cluster_name", "cluster_explanation", "is_STR",
             "avg_monthly_revenue", "avg_monthly_sales", "avg_monthly_roomnights", "avg_monthly_gbb",
             "total_revenue_24m", "ADR", "sales_per_roomnight", "revenue_per_booking", "LOS",
             "SI", "CV", "top3_share", "summer_share", "winter_share", "peak_month",
