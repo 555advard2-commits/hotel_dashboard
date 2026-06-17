@@ -64,7 +64,9 @@ def create_all_metrics_seasonality_fig(filtered_monthly):
                 "metric": metric_label,
                 "metric_key": metric_name,
                 "metric_value": row[metric_name],
-                "seasonality_index": row["seasonality_index"]
+                "overall_avg": row.get("overall_avg"),
+                "seasonality_index": row["seasonality_index"],
+                "hotel_count": row.get("hotel_count"),
             })
     table = pd.DataFrame(rows)
     fig = px.line(

@@ -5,45 +5,110 @@ from config import METRICS, MONTH_NAMES
 from utils import safe_divide
 
 
-def calculate_seasonality_by_segment(monthly_df, metric_name):
-    segment_totals = (
-        monthly_df.groupby(["segment_key", "month", "month_num"], as_index=False)
-        [metric_name].sum()
+def _weighted_average(values, weights):
+    values = pd.Series(values, dtype="float64")
+    weights = pd.Series(weights, dtype="float64")
+    mask = values.notna() & weights.notna() & (weights > 0)
+    if not mask.any():
+        return np.nan
+    return float(np.average(values[mask], weights=weights[mask]))
+
+
+def _filter_real_observations(monthly_df, metric_name):
+    df = monthly_df.copy()
+    if "has_source_row" in df.columns:
+        df = df[df["has_source_row"].fillna(False).astype(bool)].copy()
+    elif "has_metric_observation" in df.columns:
+        df = df[df["has_metric_observation"].fillna(False).astype(bool)].copy()
+    if df.empty:
+        return df
+    df["month"] = pd.to_datetime(df["month"], errors="coerce")
+    df = df.dropna(subset=["hotel_id", "month"])
+    df["month_num"] = df["month"].dt.month
+    df[metric_name] = pd.to_numeric(df[metric_name], errors="coerce")
+    return df.dropna(subset=[metric_name])
+
+
+def _add_outlier_flag(monthly_avg, group_cols, outlier_threshold):
+    monthly_avg = monthly_avg.copy()
+    if group_cols:
+        group_obj = monthly_avg.groupby(group_cols)["monthly_avg"]
+        mean = group_obj.transform("mean")
+        std = group_obj.transform("std")
+        z_score = (monthly_avg["monthly_avg"] - mean).abs() / std
+        monthly_avg["is_outlier"] = z_score.gt(outlier_threshold).fillna(False)
+        monthly_avg.loc[std.isna() | std.eq(0), "is_outlier"] = False
+    else:
+        mean = monthly_avg["monthly_avg"].mean()
+        std = monthly_avg["monthly_avg"].std()
+        if pd.isna(std) or std == 0:
+            monthly_avg["is_outlier"] = False
+        else:
+            z_score = (monthly_avg["monthly_avg"] - mean).abs() / std
+            monthly_avg["is_outlier"] = z_score.gt(outlier_threshold).fillna(False)
+    return monthly_avg
+
+
+def calculate_seasonality_improved(monthly_df, metric_name, group_cols=None, outlier_threshold=3):
+    group_cols = group_cols or []
+    df = _filter_real_observations(monthly_df, metric_name)
+    result_cols = [*group_cols, "month_num", metric_name, "overall_avg", "seasonality_index", "hotel_count"]
+    if df.empty:
+        return pd.DataFrame(columns=result_cols)
+
+    monthly_avg = (
+        df.groupby([*group_cols, "month", "month_num"], as_index=False)
+        .agg(
+            monthly_avg=(metric_name, "mean"),
+            hotel_count=("hotel_id", "nunique"),
+        )
     )
-    avg_by_month = (
-        segment_totals.groupby(["segment_key", "month_num"], as_index=False)
-        [metric_name].mean()
-    )
-    overall_avg = (
-        segment_totals.groupby("segment_key", as_index=False)
-        [metric_name].mean()
-        .rename(columns={metric_name: "overall_avg"})
-    )
-    seasonality = avg_by_month.merge(overall_avg, on="segment_key", how="left")
+    monthly_avg = _add_outlier_flag(monthly_avg, group_cols, outlier_threshold)
+    clean = monthly_avg[~monthly_avg["is_outlier"]].copy()
+    if clean.empty:
+        clean = monthly_avg.copy()
+
+    group_keys = [*group_cols, "month_num"]
+    calendar_rows = []
+    for key, group in clean.groupby(group_keys, dropna=False):
+        if not isinstance(key, tuple):
+            key = (key,)
+        row = {column: value for column, value in zip(group_keys, key)}
+        row[metric_name] = _weighted_average(group["monthly_avg"], group["hotel_count"])
+        row["hotel_count"] = int(group["hotel_count"].sum())
+        calendar_rows.append(row)
+    calendar_avg = pd.DataFrame(calendar_rows)
+
+    if group_cols:
+        overall_rows = []
+        for key, group in clean.groupby(group_cols, dropna=False):
+            if not isinstance(key, tuple):
+                key = (key,)
+            row = {column: value for column, value in zip(group_cols, key)}
+            row["overall_avg"] = _weighted_average(group["monthly_avg"], group["hotel_count"])
+            overall_rows.append(row)
+        overall_avg = pd.DataFrame(overall_rows)
+        seasonality = calendar_avg.merge(overall_avg, on=group_cols, how="left")
+    else:
+        seasonality = calendar_avg.copy()
+        seasonality["overall_avg"] = _weighted_average(clean["monthly_avg"], clean["hotel_count"])
+
     seasonality["seasonality_index"] = seasonality.apply(
         lambda row: safe_divide(row[metric_name], row["overall_avg"]), axis=1
     )
-    seasonality["seasonality_index"] = (
-        seasonality["seasonality_index"]
-        .replace([np.inf, -np.inf], np.nan)
-        .fillna(1)
-    )
+    seasonality["seasonality_index"] = seasonality["seasonality_index"].replace([np.inf, -np.inf], np.nan).fillna(1)
+    return seasonality[result_cols]
+
+
+def calculate_seasonality_by_segment(monthly_df, metric_name):
+    seasonality = calculate_seasonality_improved(monthly_df, metric_name, group_cols=["segment_key"])
     return seasonality[["segment_key", "month_num", "seasonality_index"]]
 
 
 def calculate_general_seasonality(monthly_df, metric_name):
-    totals = (
-        monthly_df.groupby(["month", "month_num"], as_index=False)
-        [metric_name].sum()
-    )
-    avg_by_month = (
-        totals.groupby("month_num", as_index=False)
-        [metric_name].mean()
-    )
-    overall_avg = totals[metric_name].mean()
-    avg_by_month["seasonality_index"] = avg_by_month[metric_name] / overall_avg
-    avg_by_month["month_name"] = avg_by_month["month_num"].map(MONTH_NAMES)
-    return avg_by_month
+    seasonality = calculate_seasonality_improved(monthly_df, metric_name)
+    seasonality["month_name"] = seasonality["month_num"].map(MONTH_NAMES)
+    return seasonality
 
 
 def add_expected_values(monthly_df, metric_name):

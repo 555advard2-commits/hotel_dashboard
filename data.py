@@ -1,34 +1,69 @@
+import csv
+import io
+
 import numpy as np
 import pandas as pd
 import streamlit as st
 
 from config import BOOKING_COLUMNS, ACTION_COLUMNS, METRICS
 from utils import (
-    parse_bool, parse_number, mode_value, make_segment_key,
+    parse_bool_series, parse_number_series, mode_value, make_segment_key,
     normalize_columns, classify_outcome_group
 )
 
 
-def read_csv_auto(file):
+@st.cache_data(show_spinner=False)
+def _read_csv_bytes_cached(raw_bytes):
     encodings = [
         "utf-8-sig", "utf-8", "cp1251",
         "windows-1251", "cp1252", "latin1"
     ]
+    last_error = None
     for encoding in encodings:
         try:
-            file.seek(0)
+            sample = raw_bytes[:65536].decode(encoding, errors="ignore")
+            try:
+                dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
+                separator = dialect.delimiter
+            except Exception:
+                counts = {sep: sample.count(sep) for sep in [",", ";", "\t", "|"]}
+                separator = max(counts, key=counts.get)
+                if counts[separator] == 0:
+                    separator = ","
             return pd.read_csv(
-                file, sep=None, engine="python",
-                encoding=encoding, on_bad_lines="skip"
+                io.BytesIO(raw_bytes),
+                sep=separator,
+                engine="c",
+                encoding=encoding,
+                on_bad_lines="skip",
+                low_memory=False,
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            last_error = exc
+    try:
+        return pd.read_csv(
+            io.BytesIO(raw_bytes),
+            sep=",",
+            engine="c",
+            encoding="latin1",
+            encoding_errors="replace",
+            on_bad_lines="skip",
+            low_memory=False,
+        )
+    except Exception:
+        if last_error is not None:
+            raise last_error
+        return pd.read_csv(io.BytesIO(raw_bytes), sep=None, engine="python", encoding="latin1", encoding_errors="replace", on_bad_lines="skip")
+
+
+def read_csv_auto(file):
     file.seek(0)
-    return pd.read_csv(
-        file, sep=None, engine="python",
-        encoding="latin1", encoding_errors="replace",
-        on_bad_lines="skip"
-    )
+    raw = file.read()
+    if isinstance(raw, str):
+        raw_bytes = raw.encode("utf-8", errors="replace")
+    else:
+        raw_bytes = raw
+    return _read_csv_bytes_cached(raw_bytes)
 
 
 def check_columns(df, required_columns, table_name):
@@ -46,9 +81,9 @@ def prepare_bookings_data(bookings_df):
     df["hotel_id"] = df["hotel_id"].astype(str).str.strip()
     df["booking_created_date"] = pd.to_datetime(df["booking_created_date"], errors="coerce")
     df = df.dropna(subset=["hotel_id", "booking_created_date"])
-    df["is_STR"] = df["is_STR"].apply(parse_bool)
+    df["is_STR"] = parse_bool_series(df["is_STR"])
     for metric_name in METRICS:
-        df[metric_name] = df[metric_name].apply(parse_number)
+        df[metric_name] = parse_number_series(df[metric_name])
     df["month"] = df["booking_created_date"].dt.to_period("M").dt.to_timestamp()
     df["month_num"] = df["booking_created_date"].dt.month
     hotel_attrs = (

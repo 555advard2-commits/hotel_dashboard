@@ -36,6 +36,29 @@ def parse_number(value):
         return 0.0
 
 
+def parse_number_series(series):
+    text = series.astype("string").fillna("")
+    text = text.str.strip()
+    text = text.str.replace("\xa0", "", regex=False)
+    text = text.str.replace(" ", "", regex=False)
+    text = text.str.replace(r"[^0-9,\.\-]", "", regex=True)
+    both_separators = text.str.contains(",", regex=False) & text.str.contains(".", regex=False)
+    comma_decimal = text.str.contains(",", regex=False) & ~text.str.contains(".", regex=False)
+    text = text.mask(both_separators, text.str.replace(",", "", regex=False))
+    text = text.mask(comma_decimal, text.str.replace(",", ".", regex=False))
+    return pd.to_numeric(text, errors="coerce").fillna(0.0)
+
+
+def parse_bool_series(series):
+    text = series.astype("string").fillna("").str.strip().str.lower()
+    true_values = {
+        "true", "1", "yes", "y", "str",
+        "\u0434\u0430", "\u0438\u0441\u0442\u0438\u043d\u0430",
+        "\u0430\u043f\u0430\u0440\u0442", "\u0430\u043f\u0430\u0440\u0442-\u043e\u0442\u0435\u043b\u044c",
+    }
+    return text.isin(true_values)
+
+
 def safe_divide(a, b):
     if b == 0 or pd.isna(b):
         return np.nan

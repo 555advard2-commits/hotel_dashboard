@@ -1,5 +1,41 @@
 # AGENTS.md
 
+## Codex Dev-Team Adapter
+
+This workspace is configured for Codex, not Claude-only automation.
+Codex should act as the orchestrator for a small development team and preserve
+all project-specific rules below.
+
+Read these at startup for substantial work:
+
+- `AGENTS.md` — local project constraints and runtime rules.
+- `codex/AGENTS.md` — Codex dev-team operating model.
+- `codex/role-cards/*.md` — reusable role cards for departments.
+- `docs/lessons.md` — durable project memory.
+
+Team roles available to delegate or emulate:
+
+- `orchestrator`
+- `ui-designer`
+- `frontend`
+- `backend`
+- `tester`
+- `security`
+- `verifier`
+
+Handoff folders:
+
+- `docs/design/`
+- `docs/api/`
+- `docs/test-report/`
+- `docs/security/`
+- `docs/verify/`
+- `docs/lessons.md`
+
+Docker is not available in this workspace, so `dev-team/memory-store` is not
+enabled. Use the project docs above as team memory. Do not commit or push unless
+the user explicitly asks.
+
 ## What this is
 
 A Streamlit dashboard refactored into a 12-file `hotel_dashboard/` package (was monolithic `app_tz_v11_stats_clusters.py` ~4710 lines). Russian UI, English title "Hotel Seasonality & Manager Impact Dashboard". No tests, no CI, no manifests.

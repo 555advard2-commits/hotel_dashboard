@@ -227,6 +227,10 @@ def _prepare_gbb_monthly(bookings_df):
             df["month"] = df["booking_created_date"]
         else:
             raise ValueError("Для t-test нужна колонка month, calendar_month или booking_created_date")
+    if "has_source_row" in df.columns:
+        df = df[df["has_source_row"].fillna(False).astype(bool)].copy()
+    elif "has_metric_observation" in df.columns:
+        df = df[df["has_metric_observation"].fillna(False).astype(bool)].copy()
     df["hotel_id"] = df["hotel_id"].astype("string").str.strip()
     df["month"] = df["month"].map(normalize_month).astype("period[M]")
     df["gbb"] = pd.to_numeric(df["gbb"], errors="coerce")
@@ -255,7 +259,10 @@ def build_manager_action_ttest(
             "source": "streamlit",
             "hotels_count": int(monthly["hotel_id"].nunique()) if not monthly.empty else 0,
             "actions_count": 0,
+            "valid_pairs_before_dedup": 0,
             "valid_pairs_count": 0,
+            "duplicate_pairs_removed": 0,
+            "excluded_pairs_count": 0,
             "subjects_total": 0,
             "subjects_tested": 0,
             "subjects_significant": 0,
@@ -307,6 +314,8 @@ def build_manager_action_ttest(
     pairs.loc[pairs["gbb_before"].replace([np.inf, -np.inf], np.nan).isna() & pairs["exclusion_reason"].isna(), ["pair_status", "exclusion_reason"]] = ["excluded", "invalid_gbb_value"]
     pairs.loc[pairs["gbb_after"].replace([np.inf, -np.inf], np.nan).isna() & pairs["exclusion_reason"].isna(), ["pair_status", "exclusion_reason"]] = ["excluded", "invalid_gbb_value"]
 
+    valid_pairs_raw_count = int(pairs["pair_status"].eq("valid").sum())
+    excluded_pairs_count = int(pairs["pair_status"].eq("excluded").sum())
     valid_pairs = pairs[pairs["pair_status"].eq("valid")].copy()
     valid_pairs["dedup_key"] = (
         valid_pairs["hotel_id"].astype(str) + "|" + valid_pairs["subject_normalized"].astype(str) + "|"
@@ -315,6 +324,7 @@ def build_manager_action_ttest(
     )
     if dedup_enabled:
         valid_pairs = valid_pairs.drop_duplicates("dedup_key", keep="first").copy()
+    duplicate_pairs_removed = valid_pairs_raw_count - int(len(valid_pairs))
 
     rows = []
     for (subject, effect_window), group in valid_pairs.groupby(["subject_canonical", "effect_window"], dropna=False):
@@ -374,7 +384,10 @@ def build_manager_action_ttest(
         "source": "streamlit",
         "hotels_count": int(monthly["hotel_id"].nunique()) if not monthly.empty else 0,
         "actions_count": int(len(actions)),
+        "valid_pairs_before_dedup": valid_pairs_raw_count,
         "valid_pairs_count": int(len(valid_pairs)),
+        "duplicate_pairs_removed": duplicate_pairs_removed,
+        "excluded_pairs_count": excluded_pairs_count,
         "subjects_total": int(actions["subject_normalized"].nunique()),
         "subjects_tested": int((results["n"] >= min_observations).sum()) if not results.empty else 0,
         "subjects_significant": int(results["is_significant"].sum()) if not results.empty else 0,

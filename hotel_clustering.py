@@ -459,10 +459,11 @@ def _run_clustering(features_df, k, feature_columns, mode_name):
     result.attrs["features_scaled"] = scaled
     metrics = evaluate_clustering(scaled.values, labels, inertia=inertia)
     metrics["feature_columns"] = usable
-    profile = build_cluster_profile(result)
+    result.attrs["cluster_mode"] = mode_name
+    profile = build_cluster_profile(result, mode_name=mode_name)
     names = dict(zip(profile["cluster_id"], profile["cluster_name"])) if not profile.empty else {}
     explanations = dict(zip(profile["cluster_id"], profile["cluster_explanation"])) if not profile.empty and "cluster_explanation" in profile.columns else {}
-    result["cluster_name"] = result["cluster_id"].map(names).fillna(result["cluster_id"].apply(lambda x: f"??????? {int(x)}"))
+    result["cluster_name"] = result["cluster_id"].map(names).fillna(result["cluster_id"].apply(lambda x: f"Кластер {int(x)}"))
     result["cluster_explanation"] = result["cluster_id"].map(explanations).fillna("")
     return result, scaled, metrics
 
@@ -560,8 +561,63 @@ def _name_cluster(row, global_stats):
     return " ".join(labels).capitalize()
 
 
-def _explain_cluster(row, global_stats):
-    traits = _build_cluster_traits(row, global_stats)
+def _build_economic_traits(row, global_stats):
+    medians = global_stats.get("medians", {})
+    traits = []
+
+    revenue_delta = _safe_relative_delta(row.get("avg_revenue"), medians.get("avg_monthly_revenue"))
+    roomnights_delta = _safe_relative_delta(row.get("avg_roomnights"), medians.get("avg_monthly_roomnights"))
+    gbb_delta = _safe_relative_delta(row.get("avg_gbb"), medians.get("avg_monthly_gbb"))
+    scale_score = np.nanmean([revenue_delta, roomnights_delta, gbb_delta])
+    if pd.isna(scale_score):
+        scale_score = revenue_delta
+
+    if scale_score >= 0.30:
+        traits.append((abs(scale_score), _cluster_label("\\u043a\\u0440\\u0443\\u043f\\u043d\\u044b\\u0435"), _cluster_label("\\u0432\\u044b\\u0448\\u0435 \\u043c\\u0435\\u0434\\u0438\\u0430\\u043d\\u044b \\u043f\\u043e revenue, roomnights \\u0438 GBB")))
+    elif scale_score <= -0.30:
+        traits.append((abs(scale_score), _cluster_label("\\u043c\\u0430\\u043b\\u044b\\u0435"), _cluster_label("\\u043d\\u0438\\u0436\\u0435 \\u043c\\u0435\\u0434\\u0438\\u0430\\u043d\\u044b \\u043f\\u043e revenue, roomnights \\u0438 GBB")))
+    else:
+        traits.append((0.10, _cluster_label("\\u0441\\u0440\\u0435\\u0434\\u043d\\u0438\\u0435"), _cluster_label("\\u0431\\u043b\\u0438\\u0437\\u043a\\u0438 \\u043a \\u043c\\u0435\\u0434\\u0438\\u0430\\u043d\\u0435 \\u043f\\u043e \\u043c\\u0430\\u0441\\u0448\\u0442\\u0430\\u0431\\u0443")))
+
+    adr_delta = _safe_relative_delta(row.get("ADR"), medians.get("ADR"))
+    sales_per_roomnight_delta = _safe_relative_delta(row.get("sales_per_roomnight"), medians.get("sales_per_roomnight"))
+    price_score = np.nanmean([adr_delta, sales_per_roomnight_delta])
+    if pd.isna(price_score):
+        price_score = adr_delta
+    if price_score >= 0.25:
+        traits.append((abs(price_score), _cluster_label("\\u0434\\u043e\\u0440\\u043e\\u0433\\u0438\\u0435"), _cluster_label("ADR \\u0438 sales per roomnight \\u0432\\u044b\\u0448\\u0435 \\u0442\\u0438\\u043f\\u0438\\u0447\\u043d\\u043e\\u0433\\u043e \\u0443\\u0440\\u043e\\u0432\\u043d\\u044f")))
+    elif price_score <= -0.25:
+        traits.append((abs(price_score), _cluster_label("\\u0431\\u044e\\u0434\\u0436\\u0435\\u0442\\u043d\\u044b\\u0435"), _cluster_label("ADR \\u0438 sales per roomnight \\u043d\\u0438\\u0436\\u0435 \\u0442\\u0438\\u043f\\u0438\\u0447\\u043d\\u043e\\u0433\\u043e \\u0443\\u0440\\u043e\\u0432\\u043d\\u044f")))
+    else:
+        traits.append((0.08, _cluster_label("\\u043c\\u0430\\u0441\\u0441\\u043e\\u0432\\u044b\\u0435"), _cluster_label("\\u0446\\u0435\\u043d\\u0430 \\u0431\\u043b\\u0438\\u0437\\u043a\\u0430 \\u043a \\u0441\\u0440\\u0435\\u0434\\u043d\\u0435\\u043c\\u0443 \\u0443\\u0440\\u043e\\u0432\\u043d\\u044e")))
+
+    los_delta = _safe_relative_delta(row.get("LOS"), medians.get("LOS"))
+    if row.get("str_share", 0) >= 0.60:
+        traits.append((1.20, _cluster_label("\\u0430\\u043f\\u0430\\u0440\\u0442\\u0430\\u043c\\u0435\\u043d\\u0442\\u044b / long-stay"), _cluster_label("\\u0432\\u044b\\u0441\\u043e\\u043a\\u0430\\u044f \\u0434\\u043e\\u043b\\u044f \\u0430\\u043f\\u0430\\u0440\\u0442\\u0430\\u043c\\u0435\\u043d\\u0442\\u043e\\u0432")))
+    elif los_delta >= 0.35:
+        traits.append((abs(los_delta), _cluster_label("long-stay"), _cluster_label("LOS \\u0432\\u044b\\u0448\\u0435 \\u043c\\u0435\\u0434\\u0438\\u0430\\u043d\\u044b")))
+    elif los_delta <= -0.30:
+        traits.append((abs(los_delta), _cluster_label("\\u043a\\u043e\\u0440\\u043e\\u0442\\u043a\\u0438\\u0435 \\u043f\\u0440\\u043e\\u0436\\u0438\\u0432\\u0430\\u043d\\u0438\\u044f"), _cluster_label("LOS \\u043d\\u0438\\u0436\\u0435 \\u043c\\u0435\\u0434\\u0438\\u0430\\u043d\\u044b")))
+
+    return sorted(traits, key=lambda item: item[0], reverse=True)
+
+
+def _name_economic_cluster(row, global_stats):
+    traits = _build_economic_traits(row, global_stats)
+    labels = []
+    for _, label, _ in traits:
+        if label not in labels:
+            labels.append(label)
+        if len(labels) >= 3:
+            break
+    return " ".join(labels).capitalize()
+
+
+def _explain_cluster(row, global_stats, mode_name="complex"):
+    if mode_name == "economic":
+        traits = _build_economic_traits(row, global_stats)
+    else:
+        traits = _build_cluster_traits(row, global_stats)
     reasons = []
     for _, _, reason in traits[:4]:
         if reason not in reasons:
@@ -571,7 +627,7 @@ def _explain_cluster(row, global_stats):
     return "; ".join(reasons)
 
 
-def build_cluster_profile(clustered_df):
+def build_cluster_profile(clustered_df, mode_name=None):
     """
     Формирует таблицу профиля кластеров.
     """
@@ -580,6 +636,7 @@ def build_cluster_profile(clustered_df):
     df = clustered_df.dropna(subset=["cluster_id"]).copy()
     if df.empty:
         return pd.DataFrame()
+    mode_name = mode_name or clustered_df.attrs.get("cluster_mode", "complex")
     profile = (
         df.groupby("cluster_id", as_index=False)
         .agg(
@@ -590,6 +647,7 @@ def build_cluster_profile(clustered_df):
             avg_roomnights=("avg_monthly_roomnights", "mean"),
             avg_gbb=("avg_monthly_gbb", "mean"),
             ADR=("ADR", "mean"),
+            sales_per_roomnight=("sales_per_roomnight", "mean"),
             LOS=("LOS", "mean"),
             SI=("SI", "mean"),
             CV=("CV", "mean"),
@@ -601,7 +659,10 @@ def build_cluster_profile(clustered_df):
         .sort_values("cluster_id")
     )
     global_stats = {
-        "medians": df[["avg_monthly_revenue", "ADR", "LOS", "CV"]].median(numeric_only=True).to_dict(),
+        "medians": df[[
+            "avg_monthly_revenue", "avg_monthly_roomnights", "avg_monthly_gbb",
+            "sales_per_roomnight", "ADR", "LOS", "CV"
+        ]].median(numeric_only=True).to_dict(),
         "means": df[["summer_share", "winter_share"]].mean(numeric_only=True).to_dict(),
     }
     top_months = []
@@ -614,13 +675,21 @@ def build_cluster_profile(clustered_df):
             "top_demand_months": ", ".join(MONTH_NAMES_SHORT[int(col[-2:])] for col in top.index)
         })
     profile = profile.merge(pd.DataFrame(top_months), on="cluster_id", how="left")
-    profile["cluster_name"] = profile.apply(lambda row: _name_cluster(row, global_stats), axis=1)
-    profile["cluster_explanation"] = profile.apply(lambda row: _explain_cluster(row, global_stats), axis=1)
+    if mode_name == "economic":
+        profile["cluster_name"] = profile.apply(lambda row: _name_economic_cluster(row, global_stats), axis=1)
+    else:
+        profile["cluster_name"] = profile.apply(lambda row: _name_cluster(row, global_stats), axis=1)
+    profile["cluster_explanation"] = profile.apply(lambda row: _explain_cluster(row, global_stats, mode_name), axis=1)
     duplicated = profile["cluster_name"].duplicated(keep=False)
     if duplicated.any():
-        profile.loc[duplicated, "cluster_name"] = profile.loc[duplicated].apply(
-            lambda row: f"{row['cluster_name']} / {row['top_demand_months']}", axis=1
-        )
+        if mode_name == "economic":
+            profile.loc[duplicated, "cluster_name"] = profile.loc[duplicated].apply(
+                lambda row: f"{row['cluster_name']} / сегмент {int(row['cluster_id'])}", axis=1
+            )
+        else:
+            profile.loc[duplicated, "cluster_name"] = profile.loc[duplicated].apply(
+                lambda row: f"{row['cluster_name']} / {row['top_demand_months']}", axis=1
+            )
     return profile
 
 

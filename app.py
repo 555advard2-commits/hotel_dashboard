@@ -25,7 +25,7 @@ from data import (
 )
 from model import (
     add_expected_values, calculate_hotel_scores, calculate_metric_summary,
-    calculate_seasonality_by_segment
+    calculate_seasonality_improved
 )
 from analysis import (
     evaluate_sample_quality, calculate_period_classification,
@@ -126,6 +126,100 @@ def render_method_note(title, body):
     )
 
 
+def render_cluster_takeaways(title, items):
+    clean_items = [str(item).strip() for item in items if str(item).strip()]
+    if not clean_items:
+        return
+    list_html = "".join(f"<li>{html.escape(item)}</li>" for item in clean_items)
+    st.markdown(
+        f"""
+        <div class="corporate-card">
+            <h3>{html.escape(title)}</h3>
+            <ul>{list_html}</ul>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+
+def build_cluster_quality_takeaways(cluster_profile, cluster_metrics, requested_k):
+    if cluster_profile is None or cluster_profile.empty:
+        return ["Профиль кластеров пустой: выводы по качеству недоступны."]
+    hotels_total = int(cluster_profile["hotels_count"].sum())
+    actual_k = int(cluster_profile["cluster_id"].nunique())
+    min_size = int(cluster_profile["hotels_count"].min())
+    max_size = int(cluster_profile["hotels_count"].max())
+    max_share = max_size / hotels_total if hotels_total else 0
+    silhouette = cluster_metrics.get("silhouette_score")
+    items = [
+        f"Запрошено k = {requested_k}, фактически построено {actual_k} кластеров на {hotels_total} отелях.",
+        f"Размеры кластеров: минимум {min_size}, максимум {max_size}; крупнейший кластер забирает {max_share:.0%} выборки.",
+    ]
+    if pd.notna(silhouette):
+        if silhouette >= 0.35:
+            items.append(f"Silhouette score = {silhouette:.3f}: разделение выглядит достаточно читаемым.")
+        elif silhouette >= 0.15:
+            items.append(f"Silhouette score = {silhouette:.3f}: кластеры есть, но границы умеренно размыты.")
+        else:
+            items.append(f"Silhouette score = {silhouette:.3f}: кластеры близки друг к другу, k и набор признаков стоит перепроверить.")
+    if min_size < 20:
+        items.append(f"Минимальный кластер содержит {min_size} отелей: для бизнес-выводов это мало, лучше проверить меньшее k.")
+    if max_share >= 0.70 and actual_k > 1:
+        items.append("Один кластер забирает больше 70% выборки: типология может быть перекошена в сторону одной большой группы.")
+    return items
+
+
+def build_cluster_profile_takeaways(cluster_profile):
+    if cluster_profile is None or cluster_profile.empty:
+        return []
+    items = []
+    for _, row in cluster_profile.sort_values("hotels_count", ascending=False).iterrows():
+        name = row.get("cluster_name", f"Кластер {row.get('cluster_id', '')}")
+        count = int(row.get("hotels_count", 0))
+        str_share = row.get("str_share")
+        explanation = row.get("cluster_explanation", "")
+        str_part = f", STR {str_share:.0%}" if pd.notna(str_share) else ""
+        items.append(f"{name}: {count} отелей{str_part}. Отличия: {explanation}.")
+    return items
+
+
+def build_seasonality_takeaways(seasonality_df):
+    if seasonality_df is None or seasonality_df.empty:
+        return []
+    df = seasonality_df.copy()
+    df = df[pd.to_numeric(df["seasonality_index"], errors="coerce").notna()].copy()
+    if df.empty:
+        return ["Сезонный индекс не рассчитался: в выбранной базе недостаточно валидных месячных значений."]
+    peak = df.loc[df["seasonality_index"].idxmax()]
+    low = df.loc[df["seasonality_index"].idxmin()]
+    spread = (
+        df.groupby("cluster_name")["seasonality_index"]
+        .agg(lambda x: float(x.max() - x.min()))
+        .sort_values(ascending=False)
+    )
+    most_seasonal = spread.index[0] if not spread.empty else None
+    items = [
+        f"Максимальный сезонный пик: {peak['cluster_name']} в месяце {peak['month_name']} — индекс {peak['seasonality_index']:.2f}.",
+        f"Самая слабая сезонная точка: {low['cluster_name']} в месяце {low['month_name']} — индекс {low['seasonality_index']:.2f}.",
+    ]
+    if most_seasonal is not None:
+        items.append(f"Самый выраженный сезонный профиль у кластера «{most_seasonal}»: у него максимальный размах индекса по месяцам.")
+    return items
+
+
+def build_heatmap_takeaways(heat_z):
+    if heat_z is None or heat_z.empty:
+        return []
+    items = []
+    for cluster_name, row in heat_z.fillna(0).iterrows():
+        top_high = row.sort_values(ascending=False).head(2)
+        top_low = row.sort_values(ascending=True).head(2)
+        high_text = ", ".join(f"{col} ({value:.1f})" for col, value in top_high.items())
+        low_text = ", ".join(f"{col} ({value:.1f})" for col, value in top_low.items())
+        items.append(f"{cluster_name}: выше среднего — {high_text}; ниже среднего — {low_text}.")
+    return items
+
+
 st.set_page_config(
     page_title="Hotel Seasonality & Manager Impact",
     layout="wide",
@@ -140,6 +234,16 @@ def build_clustering_features_cached(monthly_df):
         monthly_panel = build_monthly_panel(monthly_df)
     with timed_step("clustering.build_hotel_features"):
         return build_hotel_features(monthly_panel)
+
+
+@st.cache_data(show_spinner=False)
+def run_clustering_cached(features_df, cluster_mode_value, cluster_k_value):
+    with timed_step("clustering.run_algorithm"):
+        if cluster_mode_value == "Сезонная":
+            return run_seasonal_clustering(features_df, cluster_k_value)
+        if cluster_mode_value == "Экономическая":
+            return run_economic_clustering(features_df, cluster_k_value)
+        return run_complex_clustering(features_df, cluster_k_value)
 
 
 @st.cache_data(show_spinner=False)
@@ -687,25 +791,48 @@ with tab2:
     fig, seasonality_table = create_all_metrics_seasonality_fig(filtered_monthly)
     safe_plotly_chart(fig, use_container_width=True, key="plot_seasonality_all_metrics")
     st.caption("Индекс 1.20 = месяц на 20% сильнее среднего. Индекс 0.80 = месяц на 20% слабее среднего.")
+    seasonality_table["metric_value"] = seasonality_table["metric_value"].round(2)
+    seasonality_table["overall_avg"] = seasonality_table["overall_avg"].round(2)
     seasonality_table["seasonality_index"] = seasonality_table["seasonality_index"].round(3)
     st.dataframe(
-        seasonality_table[["metric", "month_num", "month_name", "metric_value", "seasonality_index"]],
+        seasonality_table[["metric", "month_num", "month_name", "metric_value", "overall_avg", "seasonality_index", "hotel_count"]],
         use_container_width=True,
         hide_index=True
     )
+    render_method_note(
+        "Проверка формулы",
+        "График по четырём основным метрикам считается по новой формуле: среднее значение календарного месяца по отелям делится на взвешенное среднее по всем месяцам; вес месяца — количество отелей, месяцы-выбросы исключаются по Z-score."
+    )
 
     st.subheader("Сезонность по типу объекта")
-    st.caption("Регионов нет. Сравнение делается только внутри одной локалии по типу объекта: STR / HOTEL.")
-    seg_seasonality = calculate_seasonality_by_segment(filtered_monthly, metric)
+    st.caption("Регионов нет. Сравнение делается внутри одной локалии по типу объекта: Апартаменты / Отели.")
+    object_monthly = filtered_monthly.copy()
+    object_monthly["object_type_label"] = np.where(object_monthly["is_STR"] == True, "Апартаменты", "Отели")
+    seg_seasonality = calculate_seasonality_improved(
+        object_monthly,
+        metric,
+        group_cols=["object_type_label"],
+    )
     seg_seasonality["month_name"] = seg_seasonality["month_num"].map(MONTH_NAMES)
     fig = px.line(
         seg_seasonality,
-        x="month_name", y="seasonality_index", color="segment_key",
+        x="month_name", y="seasonality_index", color="object_type_label",
         markers=True,
-        labels={"month_name": "Месяц", "seasonality_index": "Сезонный индекс", "segment_key": "Тип объекта"}
+        labels={
+            "month_name": "Месяц",
+            "seasonality_index": "Сезонный индекс",
+            "object_type_label": "Тип объекта",
+            "hotel_count": "Отелей в месяце",
+        },
+        hover_data=["hotel_count"],
     )
     fig.update_layout(xaxis={"categoryorder": "array", "categoryarray": MONTH_ORDER})
     safe_plotly_chart(fig, use_container_width=True, key="plot_seasonality_by_segment")
+    shown_object_types = ", ".join(sorted(seg_seasonality["object_type_label"].dropna().unique()))
+    render_method_note(
+        "Вывод по типу объекта",
+        f"На графике показаны типы объекта из текущей выборки Блока 2: {shown_object_types}. Если выбран фильтр «Все», одновременно отображаются Апартаменты и Отели; если выбран один тип объекта, график показывает только его."
+    )
 
 with tab4:
     st.subheader("Оценка влияния Action Logs")
@@ -860,9 +987,14 @@ with tab7:
     else:
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Action Logs", f"{ttest_run_summary['actions_count']:,}".replace(",", " "))
-        c2.metric("Валидных пар", f"{ttest_run_summary['valid_pairs_count']:,}".replace(",", " "))
-        c3.metric("Subject tested", f"{ttest_run_summary['subjects_tested']:,}".replace(",", " "))
+        c2.metric("Пар до дедупликации", f"{ttest_run_summary['valid_pairs_before_dedup']:,}".replace(",", " "))
+        c3.metric("Пар в t-test", f"{ttest_run_summary['valid_pairs_count']:,}".replace(",", " "))
         c4.metric("Значимых subject", f"{ttest_run_summary['subjects_significant']:,}".replace(",", " "))
+        st.caption(
+            f"Исключено пар: {ttest_run_summary['excluded_pairs_count']:,}; "
+            f"дублей снято: {ttest_run_summary['duplicate_pairs_removed']:,}; "
+            f"subject tested: {ttest_run_summary['subjects_tested']:,}."
+        )
 
         significant = ttest_table[ttest_table["is_significant"] == True].copy()
         if significant.empty:
@@ -934,20 +1066,13 @@ with tab8:
         "Кластеры строятся только на признаках отеля: масштаб, цена, сезонность, стабильность и динамика. "
         "BizDev-действия присоединяются только после присвоения cluster_id."
     )
-    col_a, col_b, col_c, col_d = st.columns([1.2, 1.2, 0.8, 0.9])
+    col_a, col_c = st.columns([1.4, 0.8])
     with col_a:
         cluster_mode = st.selectbox(
             "Тип кластеризации",
             ["Комплексная", "Сезонная", "Экономическая"],
             index=0,
             help="Выбирает набор признаков для кластеризации: комплексный бизнес-профиль, сезонность или экономика объекта."
-        )
-    with col_b:
-        cluster_sample = st.selectbox(
-            "Выборка данных",
-            ["Полные 24 месяца", "20+ месяцев", "12+ месяцев", "Все доступные"],
-            index=1,
-            help="Ограничивает отели по количеству месяцев с данными. Чем строже выборка, тем надёжнее сезонные признаки."
         )
     with col_c:
         cluster_k = st.selectbox(
@@ -956,57 +1081,44 @@ with tab8:
             index=2,
             help="Количество групп, на которые K-means разделит отели. Финальный выбор стоит сверять с профилем кластеров и их размерами."
         )
-    with col_d:
-        run_cluster = st.button(
-            "Запустить кластеризацию",
-            use_container_width=True,
-            help="Считает признаки отелей, запускает кластеризацию и строит таблицы/графики. Action Logs не входят в признаки."
-        )
+    with st.spinner("Готовим признаки и запускаем кластеризацию..."):
+        with timed_step("clustering.get_features_cached"):
+            hotel_features = build_clustering_features_cached(filtered_monthly)
+    features_for_cluster = hotel_features.copy()
 
-    if run_cluster:
-        with st.spinner("Ð“Ð¾Ñ‚Ð¾Ð²Ð¸Ð¼ Ð¿Ñ€Ð¸Ð·Ð½Ð°ÐºÐ¸ Ð¸ Ð·Ð°Ð¿ÑƒÑÐºÐ°ÐµÐ¼ ÐºÐ»Ð°ÑÑ‚ÐµÑ€Ð¸Ð·Ð°Ñ†Ð¸ÑŽ..."):
-            with timed_step("clustering.get_features_cached"):
-                hotel_features = build_clustering_features_cached(filtered_monthly)
+    if features_for_cluster.empty or features_for_cluster["hotel_id"].nunique() < 3:
+        st.warning("Недостаточно отелей для кластеризации после фильтров Блока 2.")
     else:
-        hotel_features = pd.DataFrame(columns=["hotel_id", "months_available", "has_full_24m"])
-    min_months_by_sample = {
-        "Полные 24 месяца": 24,
-        "20+ месяцев": 20,
-        "12+ месяцев": 12,
-        "Все доступные": 1,
-    }
-    with timed_step("clustering.apply_sample_filter"):
-        min_months = min_months_by_sample[cluster_sample]
-        features_for_cluster = hotel_features[hotel_features["months_available"] >= min_months].copy()
-        if cluster_sample == "Полные 24 месяца":
-            features_for_cluster = features_for_cluster[features_for_cluster["has_full_24m"] == True].copy()
-
-    if not run_cluster:
-        st.info("Выбери настройки и нажми «Запустить кластеризацию».")
-    elif features_for_cluster.empty or features_for_cluster["hotel_id"].nunique() < 3:
-        st.warning("Недостаточно отелей для кластеризации после выбранного ограничения по месяцам.")
-    else:
-        with timed_step("clustering.run_algorithm"):
-            if cluster_mode == "Сезонная":
-                clustered_df, features_scaled, cluster_metrics = run_seasonal_clustering(features_for_cluster, cluster_k)
-            elif cluster_mode == "Экономическая":
-                clustered_df, features_scaled, cluster_metrics = run_economic_clustering(features_for_cluster, cluster_k)
-            else:
-                clustered_df, features_scaled, cluster_metrics = run_complex_clustering(features_for_cluster, cluster_k)
+        clustered_df, features_scaled, cluster_metrics = run_clustering_cached(features_for_cluster, cluster_mode, cluster_k)
         with timed_step("clustering.build_cluster_profile"):
-            cluster_profile = build_cluster_profile(clustered_df)
+            cluster_profile = build_cluster_profile(clustered_df, mode_name={"Сезонная": "seasonal", "Экономическая": "economic"}.get(cluster_mode, "complex"))
         with timed_step("clustering.attach_bizdev_actions"):
             bizdev_actions_by_cluster = attach_bizdev_actions(clustered_df, filtered_actions)
         with timed_step("clustering.bizdev_effect_by_cluster"):
             bizdev_effect_by_cluster = build_bizdev_effect_by_cluster(clustered_df, action_impact)
 
-        m1, m2, m3 = st.columns(3)
+        min_cluster_size = int(cluster_profile["hotels_count"].min()) if not cluster_profile.empty else 0
+        m1, m2, m3, m4 = st.columns(4)
         m1.metric("Отелей в кластеризации", format_number(clustered_df["hotel_id"].nunique()))
-        m2.metric("Silhouette score", format_number(cluster_metrics.get("silhouette_score"), 3))
-        m3.metric("Inertia / Elbow", format_number(cluster_metrics.get("inertia"), 2))
+        m2.metric("Фактических кластеров", format_number(clustered_df["cluster_id"].nunique()))
+        m3.metric("Silhouette score", format_number(cluster_metrics.get("silhouette_score"), 3))
+        m4.metric("Мин. размер кластера", format_number(min_cluster_size))
+        st.caption(
+            f"k = {cluster_k}. База кластеризации: выборка Блока 2 за {window_start.strftime('%Y-%m')} → {window_end.strftime('%Y-%m')}. "
+            f"В кластеризацию передано {clustered_df['hotel_id'].nunique():,} отелей из этой выборки."
+        )
+        if min_cluster_size < 20:
+            st.warning(
+                f"Есть маленький кластер: {min_cluster_size} отелей. "
+                "Для бизнес-интерпретации такой кластер может быть слишком шумным. Попробуй уменьшить k."
+            )
+        render_cluster_takeaways(
+            "Короткий вывод по кластеризации",
+            build_cluster_quality_takeaways(cluster_profile, cluster_metrics, cluster_k)
+        )
         render_method_note(
             "Как читать качество кластеризации",
-            "Silhouette score показывает, насколько отели внутри одного кластера похожи друг на друга и отличаются от соседних кластеров. Чем ближе к 1, тем лучше разделение. Inertia показывает суммарное расстояние отелей до центров кластеров: показатель полезен для сравнения разных k, но сам по себе не является бизнес-выводом."
+            "При изменении k кластеризация пересчитывается заново: меняются центры K-means, cluster_id, названия кластеров, таблицы и все графики. Silhouette score показывает, насколько отели внутри одного кластера похожи друг на друга и отличаются от соседних кластеров. Очень маленькие кластеры стоит трактовать осторожно или проверять на меньшем k."
         )
 
         st.markdown("### Таблица признаков")
@@ -1027,33 +1139,35 @@ with tab8:
         numeric_cols = profile_shown.select_dtypes(include=[np.number]).columns
         profile_shown[numeric_cols] = profile_shown[numeric_cols].round(3)
         st.dataframe(profile_shown, use_container_width=True, hide_index=True)
+        render_cluster_takeaways("Что получилось по кластерам", build_cluster_profile_takeaways(cluster_profile))
         render_cluster_explanations('Что означают столбцы профиля кластеров', profile_shown.columns)
 
         st.markdown("### Сезонность по кластерам")
-        seasonality_rows = []
-        for cluster_id, group in clustered_df.groupby("cluster_id"):
-            cluster_name = group["cluster_name"].iloc[0]
-            for month_num in range(1, 13):
-                seasonality_rows.append({
-                    "cluster_id": cluster_id,
-                    "cluster_name": cluster_name,
-                    "month_num": month_num,
-                    "month_name": MONTH_NAMES.get(month_num, str(month_num)),
-                    "roomnights_share": group[f"roomnights_share_m{month_num:02d}"].mean(),
-                    "gbb_share": group[f"gbb_share_m{month_num:02d}"].mean(),
-                    "revenue_share": group[f"revenue_share_m{month_num:02d}"].mean(),
-                })
-        seasonality_cluster_df = pd.DataFrame(seasonality_rows)
+        cluster_lookup = clustered_df[["hotel_id", "cluster_id", "cluster_name"]].drop_duplicates("hotel_id")
+        cluster_monthly = filtered_monthly.merge(cluster_lookup, on="hotel_id", how="inner")
+        seasonality_cluster_df = calculate_seasonality_improved(
+            cluster_monthly,
+            "roomnights",
+            group_cols=["cluster_id", "cluster_name"],
+        )
+        seasonality_cluster_df["month_name"] = seasonality_cluster_df["month_num"].map(MONTH_NAMES)
         seasonality_fig = px.line(
             seasonality_cluster_df,
-            x="month_name", y="roomnights_share", color="cluster_name",
+            x="month_name", y="seasonality_index", color="cluster_name",
             markers=True,
-            labels={"month_name": "Месяц", "roomnights_share": "Средняя доля спроса", "cluster_name": "Кластер"},
-            title="Средний сезонный профиль кластеров"
+            labels={
+                "month_name": "Месяц",
+                "seasonality_index": "Сезонный индекс",
+                "cluster_name": "Кластер",
+                "hotel_count": "Отелей в месяце",
+            },
+            hover_data=["hotel_count"],
+            title="Сезонный индекс roomnights по кластерам"
         )
         seasonality_fig.update_layout(xaxis={"categoryorder": "array", "categoryarray": list(MONTH_NAMES.values())})
         safe_plotly_chart(seasonality_fig, use_container_width=True, key="plot_hotel_cluster_seasonality")
-        render_method_note("Вывод по сезонности", "График показывает форму спроса внутри каждого кластера. Если линия имеет выраженный пик, кластер сезонный; если линия ровная, объекты работают более равномерно. По методике сезонность нужна для бизнес-интерпретации групп, но Action Logs не участвуют в построении этих линий.")
+        render_cluster_takeaways("Что видно по сезонности", build_seasonality_takeaways(seasonality_cluster_df))
+        render_method_note("Вывод по сезонности", "График считается по тому же принципу, что и вкладка «Сезонность»: для каждого месяца берётся среднее по отелям, месяц взвешивается по количеству отелей, а аномальные месяцы исключаются по Z-score. Если индекс выше 1, кластер сильнее своего среднего уровня; если ниже 1, месяц слабее среднего.")
         st.markdown("### PCA scatter plot")
         pca_fig = px.scatter(
             clustered_df,
@@ -1081,6 +1195,7 @@ with tab8:
             title="Отклонение признаков кластера от среднего"
         )
         safe_plotly_chart(heat_fig, use_container_width=True, key="plot_hotel_cluster_heatmap")
+        render_cluster_takeaways("Отличительные признаки кластеров", build_heatmap_takeaways(heat_z))
         render_method_note("Вывод по heatmap", "Heatmap показывает отклонения признаков кластера от среднего по всей выборке. Рыжий цвет означает, что кластер выше среднего по признаку, синий - ниже среднего. Это главный график для объяснения, чем один кластер бизнесово отличается от другого.")
         st.markdown("### Размеры кластеров")
         size_fig = px.bar(
@@ -1159,7 +1274,7 @@ with tab10:
         **Шаг 2. Агрегировать продажи до уровня hotel_id × месяц**
         **Шаг 3. Выбрать главную метрику анализа** – {METRICS[metric]}.
         **Шаг 4. Рассчитать сезонность одной локалии**
-        seasonality_index = average_calendar_month_value / average_all_months_value
+        seasonality_index = weighted_average_calendar_month_value / weighted_average_all_months_value, где вес месяца = количество отелей; месяцы-выбросы по Z-score > 3 исключаются.
         **Шаг 5. Посчитать ожидаемое значение для каждого отеля**
         expected = hotel_baseline × seasonality_index
         **Шаг 6. Посчитать эффективность отеля** hotel_efficiency = actual / expected
